@@ -355,7 +355,7 @@ pub(super) struct Interpreter<'a, 's, F, S, A> {
     actions: &'a mut A,
     fd: usize,
     stack: Vec<Value>,
-    transient: Vec<Value>,
+    transient: [Value; 32],
     hints: usize,
     ivs: usize,
     seen_ivs: bool,
@@ -375,8 +375,13 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
             source,
             actions,
             fd,
-            stack: vec![],
-            transient: vec![Value::default(); 32],
+            // CFF1 permits 48 operands and most CFF2 programs stay within
+            // that bound as well. Reserve the common case without eagerly
+            // allocating CFF2's much larger maximum.
+            stack: Vec::with_capacity(F::STACK_LIMIT.min(48)),
+            // Every interpreter needs the fixed 32-entry transient array;
+            // keeping it inline avoids one allocation per glyph.
+            transient: std::array::from_fn(|_| Value::default()),
             hints: 0,
             ivs,
             seen_ivs: false,

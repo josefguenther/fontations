@@ -21,11 +21,17 @@ fn gid_list(plan: &Plan) -> Vec<usize> {
         .collect()
 }
 
+fn index_contains(index: &read_fonts::ps::cff::index::Index<'_>, byte: u8) -> bool {
+    (0..index.count() as usize).any(|i| index.get(i).is_some_and(|data| data.contains(&byte)))
+}
+
 pub(super) fn closure(source: &Source, glyphs: &mut IntSet<GlyphId>) -> Result<()> {
     if source.cid || source.font.version() == 2 {
         return Ok(());
     }
     let charset = source.font.charset().ok_or(Error)?;
+    let subrs_may_end_in_seac = index_contains(source.font.global_subrs(), 14)
+        || source.fds.iter().any(|fd| index_contains(&fd.subrs, 14));
     let mut pending: Vec<_> = glyphs.iter().collect();
     let mut visited = BTreeSet::new();
     while let Some(gid) = pending.pop() {
@@ -38,7 +44,7 @@ pub(super) fn closure(source: &Source, glyphs: &mut IntSet<GlyphId>) -> Result<(
             .charstrings()
             .get(gid.to_u32() as usize)
             .ok_or(Error)?;
-        if !super::charstring_may_end_in_seac(data) {
+        if !super::charstring_may_end_in_seac(data, subrs_may_end_in_seac) {
             continue;
         }
         let mut rec = ();
