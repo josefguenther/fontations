@@ -140,10 +140,10 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
         operand: &Value,
     ) -> Result<()> {
         if let Some((producer, number_start, number_end)) = operand.origin {
-            if producer == key && usize::try_from(number_end).ok() == Some(start) {
+            if producer == key && number_end as usize == start {
                 self.edit(
                     key,
-                    usize::try_from(number_start).map_err(|_| Error)?,
+                    number_start as usize,
                     Edit {
                         end,
                         call: Some(target),
@@ -158,15 +158,14 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
     }
     fn width(&mut self, origin: Option<Origin>) {
         if let Some((key @ Program::Glyph(_), start, end)) = origin {
-            let Ok(start) = usize::try_from(start) else {
-                self.needs_flatten = true;
-                return;
-            };
-            let Ok(end) = usize::try_from(end) else {
-                self.needs_flatten = true;
-                return;
-            };
-            self.edit(key, start, Edit { end, call: None });
+            self.edit(
+                key,
+                start as usize,
+                Edit {
+                    end: end as usize,
+                    call: None,
+                },
+            );
         } else {
             self.needs_flatten = true;
         }
@@ -188,15 +187,11 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
                 self.needs_flatten = true;
                 return;
             };
-            if producer != key || usize::try_from(to).ok() != Some(first) {
+            if producer != key || to as usize != first {
                 self.needs_flatten = true;
                 return;
             }
-            let Ok(from) = usize::try_from(from) else {
-                self.needs_flatten = true;
-                return;
-            };
-            first = from;
+            first = from as usize;
         }
         self.edit(key, first, Edit { end, call: None });
     }
@@ -344,12 +339,7 @@ impl<'s> Recorder<'s> {
             out.extend(program.data.get(pos..start).ok_or(Error)?);
             if let Some(target) = edit.call {
                 let (op, count) = match target {
-                    Program::Local(fd, _) => (
-                        10,
-                        *local_counts
-                            .get(usize::try_from(fd).map_err(|_| Error)?)
-                            .ok_or(Error)?,
-                    ),
+                    Program::Local(fd, _) => (10, *local_counts.get(fd as usize).ok_or(Error)?),
                     Program::Global(_, _) => (29, global_count),
                     _ => return Err(Error),
                 };
@@ -614,10 +604,16 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
                 | 0x122..=0x125 => {
                     if op == 14 && !F::CFF2 && self.stack.len() >= 4 {
                         let n = self.stack.len();
-                        self.seac = Some((
-                            u8::try_from(self.stack[n - 2].int()?).map_err(|_| Error)?,
-                            u8::try_from(self.stack[n - 1].int()?).map_err(|_| Error)?,
-                        ));
+                        self.seac = self.stack[n - 2]
+                            .int()
+                            .ok()
+                            .and_then(|value| u8::try_from(value).ok())
+                            .zip(
+                                self.stack[n - 1]
+                                    .int()
+                                    .ok()
+                                    .and_then(|value| u8::try_from(value).ok()),
+                            );
                     }
                     let hint = matches!(op, 1 | 3 | 18 | 19 | 20 | 23);
                     if hint && self.drop_hints {
@@ -936,6 +932,16 @@ mod tests {
         let mut interp = Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false);
         interp.run(Program::Glyph(0), &data).unwrap();
         assert_eq!(interp.seac, Some((65, 66)));
+    }
+
+    #[test]
+    fn invalid_seac_codes_do_not_fail_interpretation() {
+        let source = Source(vec![]);
+        let data = [139, 139, 139, 139, 28, 3, 232, 14];
+        let mut actions = ();
+        let mut interp = Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false);
+        interp.run(Program::Glyph(0), &data).unwrap();
+        assert_eq!(interp.seac, None);
     }
 
     #[test]

@@ -74,6 +74,7 @@ fn charstring_may_end_in_seac(data: &[u8], subrs_may_end_in_seac: bool) -> bool 
     // when a number encoding, or a call that can leave operands on the shared
     // stack, could immediately precede endchar.
     matches!(last, 32..=246)
+        || matches!(last, 10 | 29)
         // Escaped operators include stack-preserving operations such as the
         // deprecated dotsection. Without interpreting the program, their
         // result stack cannot be ruled out as seac operands.
@@ -101,6 +102,9 @@ mod tests {
             &[139, 139, 204, 247, 86, 12, 0, 14],
         ] {
             assert!(charstring_may_end_in_seac(data, true));
+        }
+        for data in [&[32, 10, 14][..], &[32, 29, 14]] {
+            assert!(charstring_may_end_in_seac(data, false));
         }
         for data in [&[][..], &[14], &[139, 11], &[5, 14], &[247, 14]] {
             assert!(!charstring_may_end_in_seac(data, true));

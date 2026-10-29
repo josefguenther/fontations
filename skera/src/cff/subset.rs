@@ -65,6 +65,7 @@ pub(super) fn closure(source: &Source, glyphs: &mut IntSet<GlyphId>) -> Result<(
             PredefinedEncoding::Standard
                 .sid(code)
                 .and_then(|sid| charset.glyph_id(sid))
+                .filter(|gid| gid.to_u32() != 0)
         });
         let [Some(base), Some(accent)] = resolved else {
             continue;
@@ -175,10 +176,10 @@ impl<'s> CharStringActions<'s> for IdentityProgramCollector<'_, 's> {
             i32::try_from(index).map_err(|_| Error)? - encoding::bias(count),
         );
         self.copyable &= producer == key
-            && usize::try_from(number_end).ok() == Some(start)
+            && number_end as usize == start
             && self
                 .source_program(key)
-                .and_then(|data| data.get(usize::try_from(number_start).ok()?..end))
+                .and_then(|data| data.get(number_start as usize..end))
                 .is_some_and(|bytes| {
                     bytes.len() == expected_len + 1
                         && bytes[..expected_len] == expected[..expected_len]
