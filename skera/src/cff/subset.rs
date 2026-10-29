@@ -22,7 +22,12 @@ fn gid_list(plan: &Plan) -> Vec<usize> {
 }
 
 fn index_contains(index: &read_fonts::ps::cff::index::Index<'_>, byte: u8) -> bool {
-    (0..index.count() as usize).any(|i| index.get(i).is_some_and(|data| data.contains(&byte)))
+    use read_fonts::ps::cff::index::Index;
+    match index {
+        Index::Empty => false,
+        Index::Format1(index) => index.data().contains(&byte),
+        Index::Format2(index) => index.data().contains(&byte),
+    }
 }
 
 pub(super) fn closure(source: &Source, glyphs: &mut IntSet<GlyphId>) -> Result<()> {
