@@ -15,11 +15,11 @@ use std::marker::PhantomData;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(super) enum Program {
-    Glyph(usize),
-    Local(usize, usize),
-    Global(usize, usize),
+    Glyph(u32),
+    Local(u32, u32),
+    Global(u32, u32),
 }
-type Origin = (Program, usize, usize);
+type Origin = (Program, u32, u32);
 
 #[derive(Clone, Default)]
 pub(super) struct Value {
@@ -47,7 +47,7 @@ impl Value {
         Ok(self.default as i32)
     }
 
-    pub(super) fn origin(&self) -> Option<(Program, usize, usize)> {
+    pub(super) fn origin(&self) -> Option<Origin> {
         self.origin
     }
 }
@@ -140,10 +140,10 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
         operand: &Value,
     ) -> Result<()> {
         if let Some((producer, number_start, number_end)) = operand.origin {
-            if producer == key && number_end == start {
+            if producer == key && usize::try_from(number_end).ok() == Some(start) {
                 self.edit(
                     key,
-                    number_start,
+                    usize::try_from(number_start).map_err(|_| Error)?,
                     Edit {
                         end,
                         call: Some(target),
@@ -158,6 +158,14 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
     }
     fn width(&mut self, origin: Option<Origin>) {
         if let Some((key @ Program::Glyph(_), start, end)) = origin {
+            let Ok(start) = usize::try_from(start) else {
+                self.needs_flatten = true;
+                return;
+            };
+            let Ok(end) = usize::try_from(end) else {
+                self.needs_flatten = true;
+                return;
+            };
             self.edit(key, start, Edit { end, call: None });
         } else {
             self.needs_flatten = true;
@@ -180,10 +188,14 @@ impl<'s> CharStringActions<'s> for Recorder<'s> {
                 self.needs_flatten = true;
                 return;
             };
-            if producer != key || to != first {
+            if producer != key || usize::try_from(to).ok() != Some(first) {
                 self.needs_flatten = true;
                 return;
             }
+            let Ok(from) = usize::try_from(from) else {
+                self.needs_flatten = true;
+                return;
+            };
             first = from;
         }
         self.edit(key, first, Edit { end, call: None });
@@ -332,7 +344,12 @@ impl<'s> Recorder<'s> {
             out.extend(program.data.get(pos..start).ok_or(Error)?);
             if let Some(target) = edit.call {
                 let (op, count) = match target {
-                    Program::Local(fd, _) => (10, *local_counts.get(fd).ok_or(Error)?),
+                    Program::Local(fd, _) => (
+                        10,
+                        *local_counts
+                            .get(usize::try_from(fd).map_err(|_| Error)?)
+                            .ok_or(Error)?,
+                    ),
                     Program::Global(_, _) => (29, global_count),
                     _ => return Err(Error),
                 };
@@ -355,7 +372,7 @@ pub(super) struct Interpreter<'a, 's, F, S, A> {
     actions: &'a mut A,
     fd: usize,
     stack: Vec<Value>,
-    transient: [Value; 32],
+    transient: Vec<Value>,
     hints: usize,
     ivs: usize,
     seen_ivs: bool,
@@ -370,18 +387,34 @@ pub(super) struct Interpreter<'a, 's, F, S, A> {
 impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
     Interpreter<'a, 's, F, S, A>
 {
+    #[cfg(test)]
     pub fn new(source: &'s S, actions: &'a mut A, fd: usize, ivs: usize, drop_hints: bool) -> Self {
+        Self::with_stack(
+            source,
+            actions,
+            fd,
+            ivs,
+            drop_hints,
+            Vec::with_capacity(F::STACK_LIMIT.min(48)),
+        )
+    }
+    pub fn with_stack(
+        source: &'s S,
+        actions: &'a mut A,
+        fd: usize,
+        ivs: usize,
+        drop_hints: bool,
+        mut stack: Vec<Value>,
+    ) -> Self {
+        stack.clear();
         Self {
             source,
             actions,
             fd,
-            // CFF1 permits 48 operands and most CFF2 programs stay within
-            // that bound as well. Reserve the common case without eagerly
-            // allocating CFF2's much larger maximum.
-            stack: Vec::with_capacity(F::STACK_LIMIT.min(48)),
-            // Every interpreter needs the fixed 32-entry transient array;
-            // keeping it inline avoids one allocation per glyph.
-            transient: std::array::from_fn(|_| Value::default()),
+            stack,
+            // Type 2's transient array is rarely used. Allocate its large
+            // symbolic values only when a program executes `put`.
+            transient: Vec::new(),
             hints: 0,
             ivs,
             seen_ivs: false,
@@ -393,6 +426,9 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
             drop_hints,
             flavor: PhantomData,
         }
+    }
+    pub fn into_stack(self) -> Vec<Value> {
+        self.stack
     }
     fn pop(&mut self) -> Result<Value> {
         self.stack.pop().ok_or(Error)
@@ -443,7 +479,14 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
             let byte = *data.get(p).ok_or(Error)?;
             if byte >= 28 {
                 if let Some(value) = encoding::number(data, &mut p, false)? {
-                    self.push(Value::number(value, (key, start, p)))?;
+                    self.push(Value::number(
+                        value,
+                        (
+                            key,
+                            u32::try_from(start).map_err(|_| Error)?,
+                            u32::try_from(p).map_err(|_| Error)?,
+                        ),
+                    ))?;
                     continue;
                 }
             }
@@ -475,9 +518,15 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
                         .ok_or(Error)?;
                     let index = usize::try_from(index).map_err(|_| Error)?;
                     let target = if global {
-                        Program::Global(self.fd, index)
+                        Program::Global(
+                            u32::try_from(self.fd).map_err(|_| Error)?,
+                            u32::try_from(index).map_err(|_| Error)?,
+                        )
                     } else {
-                        Program::Local(self.fd, index)
+                        Program::Local(
+                            u32::try_from(self.fd).map_err(|_| Error)?,
+                            u32::try_from(index).map_err(|_| Error)?,
+                        )
                     };
                     self.actions.call(key, start, p, target, &value)?;
                     if self.execute(
@@ -563,10 +612,11 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
                 | 30
                 | 31
                 | 0x122..=0x125 => {
-                    if op == 14 && !F::CFF2 && self.stack.len() == 4 {
+                    if op == 14 && !F::CFF2 && self.stack.len() >= 4 {
+                        let n = self.stack.len();
                         self.seac = Some((
-                            u8::try_from(self.stack[2].int()?).map_err(|_| Error)?,
-                            u8::try_from(self.stack[3].int()?).map_err(|_| Error)?,
+                            u8::try_from(self.stack[n - 2].int()?).map_err(|_| Error)?,
+                            u8::try_from(self.stack[n - 1].int()?).map_err(|_| Error)?,
                         ));
                     }
                     let hint = matches!(op, 1 | 3 | 18 | 19 | 20 | 23);
@@ -618,16 +668,22 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
             }
             0x114 => {
                 let idx = usize::try_from(a.int()?).map_err(|_| Error)?;
+                if idx >= 32 {
+                    return Err(Error);
+                }
                 let v = self.pop()?;
-                *self.transient.get_mut(idx).ok_or(Error)? = v;
+                if self.transient.is_empty() {
+                    self.transient.resize_with(32, Value::default);
+                }
+                self.transient[idx] = v;
                 return Ok(());
             }
             0x115 => {
-                a = self
-                    .transient
-                    .get(usize::try_from(a.int()?).map_err(|_| Error)?)
-                    .ok_or(Error)?
-                    .clone();
+                let idx = usize::try_from(a.int()?).map_err(|_| Error)?;
+                if idx >= 32 {
+                    return Err(Error);
+                }
+                a = self.transient.get(idx).cloned().unwrap_or_default();
             }
             0x11d => {
                 let idx = a.int()?.max(0) as usize;
@@ -868,5 +924,35 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn seac_uses_the_last_two_of_at_least_four_operands() {
+        let source = Source(vec![]);
+        // Six operands avoids the optional-width case and verifies that extra
+        // live operands do not hide the final bchar/achar pair.
+        let data = [139, 139, 139, 139, 204, 205, 14];
+        let mut actions = ();
+        let mut interp = Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false);
+        interp.run(Program::Glyph(0), &data).unwrap();
+        assert_eq!(interp.seac, Some((65, 66)));
+    }
+
+    #[test]
+    fn transient_array_is_allocated_only_by_put() {
+        let source = Source(vec![]);
+        let mut actions = ();
+        let mut interp = Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false);
+        assert!(interp.transient.is_empty());
+
+        interp.push(Value::default()).unwrap();
+        interp.arithmetic(0x115).unwrap();
+        assert!(interp.transient.is_empty());
+        assert_eq!(interp.pop().unwrap().default, 0.0);
+
+        interp.push(Value::default()).unwrap();
+        interp.push(Value::default()).unwrap();
+        interp.arithmetic(0x114).unwrap();
+        assert_eq!(interp.transient.len(), 32);
     }
 }

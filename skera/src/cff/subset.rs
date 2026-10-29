@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{FastHashMap, Plan, SubsetFlags};
 use read_fonts::{collections::IntSet, ps::PredefinedEncoding, types::GlyphId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 fn gid_list(plan: &Plan) -> Vec<usize> {
     (0..plan.num_output_glyphs)
@@ -30,36 +30,49 @@ pub(super) fn closure(source: &Source, glyphs: &mut IntSet<GlyphId>) -> Result<(
         return Ok(());
     }
     let charset = source.font.charset().ok_or(Error)?;
+    // Match HarfBuzz's conservative shortcut: a call can only be skipped
+    // when no source subroutine contains an `endchar` byte. Subroutinizers
+    // commonly move endchar, so the shortcut is intentionally font-dependent.
     let subrs_may_end_in_seac = index_contains(source.font.global_subrs(), 14)
         || source.fds.iter().any(|fd| index_contains(&fd.subrs, 14));
-    let mut pending: Vec<_> = glyphs.iter().collect();
-    let mut visited = BTreeSet::new();
-    while let Some(gid) = pending.pop() {
-        if !visited.insert(gid.to_u32()) {
+    let mut components = Vec::new();
+    let mut stack = Vec::with_capacity(48);
+    for gid in glyphs.iter() {
+        let Ok(fd) = source.fd(gid) else { continue };
+        let Some(data) = source.font.charstrings().get(gid.to_u32() as usize) else {
             continue;
-        }
-        let fd = source.fd(gid)?;
-        let data = source
-            .font
-            .charstrings()
-            .get(gid.to_u32() as usize)
-            .ok_or(Error)?;
+        };
         if !super::charstring_may_end_in_seac(data, subrs_may_end_in_seac) {
             continue;
         }
         let mut rec = ();
-        let mut interp =
-            Interpreter::<super::source::Cff1, _, _>::new(source, &mut rec, fd, 0, false);
-        interp.run(Program::Glyph(gid.to_u32() as usize), data)?;
-        if let Some((base, accent)) = interp.seac {
-            for code in [base, accent] {
-                let sid = PredefinedEncoding::Standard.sid(code).ok_or(Error)?;
-                let component = charset.glyph_id(sid).ok_or(Error)?;
-                if glyphs.insert(component) {
-                    pending.push(component);
-                }
-            }
+        let mut interp = Interpreter::<super::source::Cff1, _, _>::with_stack(
+            source,
+            &mut rec,
+            fd,
+            0,
+            false,
+            std::mem::take(&mut stack),
+        );
+        let result = interp.run(Program::Glyph(gid.to_u32()), data);
+        let seac = interp.seac;
+        stack = interp.into_stack();
+        if result.is_err() {
+            continue;
         }
+        let Some((base, accent)) = seac else { continue };
+        let resolved = [base, accent].map(|code| {
+            PredefinedEncoding::Standard
+                .sid(code)
+                .and_then(|sid| charset.glyph_id(sid))
+        });
+        let [Some(base), Some(accent)] = resolved else {
+            continue;
+        };
+        components.extend([base, accent]);
+    }
+    for component in components {
+        glyphs.insert(component);
     }
     Ok(())
 }
@@ -107,9 +120,11 @@ struct IdentityProgramCollector<'a, 's> {
 impl<'s> IdentityProgramCollector<'_, 's> {
     fn source_program(&self, key: Program) -> Option<&'s [u8]> {
         match key {
-            Program::Glyph(index) => self.source.font.charstrings().get(index),
-            Program::Local(fd, index) => self.source.fds.get(fd)?.subrs.get(index),
-            Program::Global(_, index) => self.source.font.global_subrs().get(index),
+            Program::Glyph(index) => self.source.font.charstrings().get(index as usize),
+            Program::Local(fd, index) => {
+                self.source.fds.get(fd as usize)?.subrs.get(index as usize)
+            }
+            Program::Global(_, index) => self.source.font.global_subrs().get(index as usize),
         }
     }
 }
@@ -120,11 +135,11 @@ impl<'s> CharStringActions<'s> for IdentityProgramCollector<'_, 's> {
     fn program(&mut self, key: Program, _data: &'s [u8]) {
         match key {
             Program::Global(_, index) => {
-                self.globals.insert(index as u32);
+                self.globals.insert(index);
             }
             Program::Local(fd, index) => {
-                if let Some(locals) = self.locals.get_mut(fd) {
-                    locals.insert(index as u32);
+                if let Some(locals) = self.locals.get_mut(fd as usize) {
+                    locals.insert(index);
                 } else {
                     self.copyable = false;
                 }
@@ -148,7 +163,7 @@ impl<'s> CharStringActions<'s> for IdentityProgramCollector<'_, 's> {
         let (op, count, index) = match target {
             Program::Local(fd, index) => (
                 10,
-                self.source.fds.get(fd).ok_or(Error)?.subrs.count() as usize,
+                self.source.fds.get(fd as usize).ok_or(Error)?.subrs.count() as usize,
                 index,
             ),
             Program::Global(_, index) => {
@@ -160,10 +175,10 @@ impl<'s> CharStringActions<'s> for IdentityProgramCollector<'_, 's> {
             i32::try_from(index).map_err(|_| Error)? - encoding::bias(count),
         );
         self.copyable &= producer == key
-            && number_end == start
+            && usize::try_from(number_end).ok() == Some(start)
             && self
                 .source_program(key)
-                .and_then(|data| data.get(number_start..end))
+                .and_then(|data| data.get(usize::try_from(number_start).ok()?..end))
                 .is_some_and(|bytes| {
                     bytes.len() == expected_len + 1
                         && bytes[..expected_len] == expected[..expected_len]
@@ -180,13 +195,22 @@ fn all_source_programs_reachable<F: CffFlavor>(source: &Source, plan: &Plan) -> 
         locals: vec![IntSet::empty(); source.fds.len()],
         copyable: true,
     };
+    let mut stack = Vec::with_capacity(F::STACK_LIMIT.min(48));
     for &(_, old) in &plan.new_to_old_gid_list {
-        let orig = old.to_u32() as usize;
-        let data = source.font.charstrings().get(orig).ok_or(Error)?;
+        let orig = old.to_u32();
+        let data = source.font.charstrings().get(orig as usize).ok_or(Error)?;
         let fd = source.fd(old)?;
-        let mut interpreter =
-            Interpreter::<F, _, _>::new(source, &mut collector, fd, source.fds[fd].ivs, false);
-        interpreter.run(Program::Glyph(orig), data)?;
+        let mut interpreter = Interpreter::<F, _, _>::with_stack(
+            source,
+            &mut collector,
+            fd,
+            source.fds[fd].ivs,
+            false,
+            std::mem::take(&mut stack),
+        );
+        let result = interpreter.run(Program::Glyph(orig), data);
+        stack = interpreter.into_stack();
+        result?;
     }
     Ok(collector.copyable
         && collector.globals.len() == source.font.global_subrs().count() as u64
@@ -197,7 +221,7 @@ fn all_source_programs_reachable<F: CffFlavor>(source: &Source, plan: &Plan) -> 
             .all(|(used, fd)| used.len() == fd.subrs.count() as u64))
 }
 
-fn remap_order(program: Program) -> (u8, usize, usize) {
+fn remap_order(program: Program) -> (u8, u32, u32) {
     match program {
         Program::Glyph(index) => (0, index, 0),
         Program::Local(fd, index) => (1, fd, index),
@@ -233,9 +257,10 @@ pub(super) fn programs<F: CffFlavor>(source: &Source, plan: &Plan) -> Result<Pro
     let mut widths = BTreeMap::new();
     let mut roots = Vec::new();
     let mut chars = vec![F::empty_glyph(); plan.num_output_glyphs];
+    let mut stack = Vec::with_capacity(F::STACK_LIMIT.min(48));
     for &(new, old) in &plan.new_to_old_gid_list {
         let gid = new.to_u32() as usize;
-        let orig = old.to_u32() as usize;
+        let orig = old.to_u32();
         if gid == 0
             && !plan
                 .subset_flags
@@ -244,19 +269,27 @@ pub(super) fn programs<F: CffFlavor>(source: &Source, plan: &Plan) -> Result<Pro
             continue;
         }
         let fd = source.fd(old)?;
-        let data = source.font.charstrings().get(orig).unwrap_or(&[]);
+        let data = source.font.charstrings().get(orig as usize).unwrap_or(&[]);
         let key = Program::Glyph(orig);
         if desub {
-            chars[gid] = flatten_glyph::<F>(source, key, fd, data, nohint)?;
+            chars[gid] = flatten_glyph::<F>(source, key, fd, data, nohint, &mut stack)?;
         } else {
             let mut glyph = Recorder::with_capacity(16);
-            let mut interpreter =
-                Interpreter::<F, _, _>::new(source, &mut glyph, fd, source.fds[fd].ivs, nohint);
-            interpreter.run(key, data)?;
+            let mut interpreter = Interpreter::<F, _, _>::with_stack(
+                source,
+                &mut glyph,
+                fd,
+                source.fds[fd].ivs,
+                nohint,
+                std::mem::take(&mut stack),
+            );
+            let result = interpreter.run(key, data);
             let width = interpreter.width;
+            stack = interpreter.into_stack();
+            result?;
             let rec = rec.as_mut().ok_or(Error)?;
             if !rec.merge(glyph) {
-                chars[gid] = flatten_glyph::<F>(source, key, fd, data, nohint)?;
+                chars[gid] = flatten_glyph::<F>(source, key, fd, data, nohint, &mut stack)?;
             } else {
                 roots.push(key);
                 widths.insert(orig, width);
@@ -272,7 +305,7 @@ pub(super) fn programs<F: CffFlavor>(source: &Source, plan: &Plan) -> Result<Pro
         let mut used = rec.closure(&roots)?;
         used.sort_unstable_by_key(|program| remap_order(*program));
         let mut remap = FastHashMap::default();
-        let mut shared_globals: BTreeMap<usize, Vec<Program>> = BTreeMap::new();
+        let mut shared_globals: BTreeMap<u32, Vec<Program>> = BTreeMap::new();
         for key in &used {
             match *key {
                 Program::Global(_, index) => {
@@ -294,8 +327,8 @@ pub(super) fn programs<F: CffFlavor>(source: &Source, plan: &Plan) -> Result<Pro
                     }
                 }
                 Program::Local(fd, _) => {
-                    remap.insert(*key, locals[fd].len());
-                    locals[fd].push(vec![]);
+                    remap.insert(*key, locals[fd as usize].len());
+                    locals[fd as usize].push(vec![]);
                 }
                 _ => (),
             }
@@ -312,12 +345,12 @@ pub(super) fn programs<F: CffFlavor>(source: &Source, plan: &Plan) -> Result<Pro
             let bytes = rec.encode(key, &remap, globals.len(), &counts)?;
             match key {
                 Program::Global(_, _) => globals[new] = bytes,
-                Program::Local(fd, _) => locals[fd][new] = bytes,
+                Program::Local(fd, _) => locals[fd as usize][new] = bytes,
                 _ => (),
             }
         }
         for &(new, old) in &plan.new_to_old_gid_list {
-            let orig = old.to_u32() as usize;
+            let orig = old.to_u32();
             if !widths.contains_key(&orig) {
                 continue;
             }
@@ -344,12 +377,21 @@ fn flatten_glyph<F: CffFlavor>(
     fd: usize,
     data: &[u8],
     nohint: bool,
+    stack: &mut Vec<Value>,
 ) -> Result<Vec<u8>> {
     let mut actions = Flattener::default();
-    let mut interpreter =
-        Interpreter::<F, _, _>::new(source, &mut actions, fd, source.fds[fd].ivs, nohint);
-    interpreter.run(key, data)?;
+    let mut interpreter = Interpreter::<F, _, _>::with_stack(
+        source,
+        &mut actions,
+        fd,
+        source.fds[fd].ivs,
+        nohint,
+        std::mem::take(stack),
+    );
+    let result = interpreter.run(key, data);
     let width = interpreter.width;
+    *stack = interpreter.into_stack();
+    result?;
     charstring::flatten(&actions.commands, width, F::CFF2, source.fds[fd].ivs)
 }
 
